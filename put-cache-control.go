@@ -3,16 +3,14 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"github.com/AdRoll/goamz/aws" //traditional library by Canonical + AdRoll
-	"github.com/AdRoll/goamz/s3"
 	sdkaws "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session" // the new library by aws
 	sdks3 "github.com/aws/aws-sdk-go/service/s3"
 	// "net/http"
-	"net/url"
+	// "net/url"
 	"os"
 	//	"os/exec"
-	"strings"
+	// "strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,7 +38,6 @@ func main() {
 }
 
 type CopyContext struct {
-	s3         *s3.Bucket
 	s3svc      *sdks3.S3
 	bucketname string
 	newvalue   string
@@ -56,14 +53,6 @@ type CopyContext struct {
 }
 
 func prepareContext() (CopyContext, error) {
-	auth, err := aws.EnvAuth()
-	if err != nil {
-		panic(err.Error())
-	}
-	// Using old library, TODO: switch everything to the new
-	s := s3.New(auth, aws.EUCentral)
-	s.Signature = aws.V4Signature
-
 	// Session with the new library
 	sess, err := session.NewSession(&sdkaws.Config{
 		Region: sdkaws.String("eu-central-1")},
@@ -76,7 +65,6 @@ func prepareContext() (CopyContext, error) {
 		panic("Please provide bucket name and desired Cache-Control setting")
 	}
 	return CopyContext{
-		s3:              s.Bucket(os.Args[1]),
 		s3svc:           sdks3.New(sess),
 		bucketname:      os.Args[1],
 		expectedObjects: 18000000,
@@ -103,30 +91,14 @@ func cpworker(context *CopyContext, names <-chan string) {
 				f.Close()
 			}
 		} else {
-			fmt.Printf("\nNo more data in names channel.\n")
+			// fmt.Printf("\nNo more data in names channel.\n")
 			context.wg.Done()
 			return
 		}
 	}
 }
 
-func encodeObjectName(name string) string {
-	/*
-		encodedName := url.QueryEscape(name)
-	*/
-
-	// Do not encode '/'
-	parts := strings.Split(name, "/")
-	for i := range parts {
-		parts[i] = url.QueryEscape(parts[i])
-	}
-	return strings.Join(parts, "/")
-}
-
 func cp(context *CopyContext, name string) error {
-	encodedName := encodeObjectName(name)
-	fmt.Println(encodedName)
-
 	headin := sdks3.HeadObjectInput{
 		Bucket: sdkaws.String(context.bucketname),
 		Key:    sdkaws.String(name),
@@ -135,16 +107,6 @@ func cp(context *CopyContext, name string) error {
 	if err != nil {
 		return fmt.Errorf("aws sdk Head failed: %v", err)
 	}
-	// fmt.Println(headresp)
-
-	/*
-		resp, err := context.s3.Head(encodedName, make(http.Header))
-		if err != nil {
-			return fmt.Errorf("HEAD failed: %v", err)
-		}
-	*/
-	//contenttypes, contenttype_present := resp.Header["Content-Type"]
-	//cache, cache_present := resp.Header["Cache-Control"]
 
 	contenttype := headresp.ContentType
 	oldcachecontrol := headresp.CacheControl
@@ -176,7 +138,7 @@ func cp(context *CopyContext, name string) error {
 			}
 		}
 
-		src := fmt.Sprintf("%s/%s", context.bucketname, encodedName)
+		src := fmt.Sprintf("%s/%s", context.bucketname, name)
 		inp := sdks3.CopyObjectInput{
 			Bucket:            sdkaws.String(context.bucketname),
 			CopySource:        &src,
