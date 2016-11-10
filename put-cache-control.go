@@ -89,7 +89,18 @@ func cpworker(context *CopyContext, names <-chan string) {
 		name, more := <-names
 		if more {
 			// fmt.Printf("Starting copy %v\n", name)
-			cp(context, name)
+			if err := cp(context, name); err != nil {
+				os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", name, err))
+				filename := "error_keys.txt"
+				os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
+				f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+				if err != nil {
+					os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
+					panic(err)
+				}
+				fmt.Fprintln(f, name)
+				f.Close()
+			}
 		} else {
 			fmt.Printf("\nNo more data in names channel.\n")
 			context.wg.Done()
@@ -98,20 +109,10 @@ func cpworker(context *CopyContext, names <-chan string) {
 	}
 }
 
-func cp(context *CopyContext, name string) {
+func cp(context *CopyContext, name string) error {
 	resp, err := context.s3.Head(name, make(http.Header))
 	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("==> Head failed for '%s' Error: %s\n", name, err.Error()))
-		filename := "error_keys.txt"
-		os.Stderr.WriteString(fmt.Sprintf("Adding file to 'TODO' list '%s'", filename))
-		f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-		if err != nil {
-			os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %s\n", filename, err.Error()))
-			panic(err)
-		}
-		fmt.Fprintln(f, name)
-		f.Close()
-		return
+		return fmt.Errorf("HEAD failed for '%s' Error: %v", name, err)
 	}
 
 	contenttypes, contenttype_present := resp.Header["Content-Type"]
@@ -145,23 +146,18 @@ func cp(context *CopyContext, name string) {
 		}
 
 		src := fmt.Sprintf("%s/%s", context.bucketname, name)
-		directive := "REPLACE"
 		inp := sdks3.CopyObjectInput{
 			Bucket:            sdkaws.String(context.bucketname),
 			CopySource:        &src,
 			Key:               &name,
 			CacheControl:      &context.newvalue,
 			ContentType:       &contenttype,
-			MetadataDirective: &directive,
+			MetadataDirective: sdkaws.String("REPLACE"),
 		}
-		// fmt.Printf("%v", inp)
-		/*resp*/ _, err := context.s3svc.CopyObject(&inp)
+		_, err := context.s3svc.CopyObject(&inp)
 		if err != nil {
-			fmt.Println("Failed changing (inplace-copying) object")
-			fmt.Println(err.Error())
-			return
+			return fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
 		}
-		// fmt.Println(resp)
 	}
 	fmt.Print(status)
 
@@ -195,4 +191,5 @@ func cp(context *CopyContext, name string) {
 			name, context.copiedObjects, context.expectedObjects, o_s, eta,
 		)
 	}
+	return nil
 }
