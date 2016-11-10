@@ -8,7 +8,7 @@ import (
 	sdkaws "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session" // the new library by aws
 	sdks3 "github.com/aws/aws-sdk-go/service/s3"
-	"net/http"
+	// "net/http"
 	"net/url"
 	"os"
 	//	"os/exec"
@@ -127,35 +127,49 @@ func cp(context *CopyContext, name string) error {
 	encodedName := encodeObjectName(name)
 	fmt.Println(encodedName)
 
-	resp, err := context.s3.Head(encodedName, make(http.Header))
-	if err != nil {
-		return fmt.Errorf("HEAD failed: %v", err)
+	headin := sdks3.HeadObjectInput{
+		Bucket: sdkaws.String(context.bucketname),
+		Key:    sdkaws.String(name),
 	}
+	headresp, err := context.s3svc.HeadObject(&headin)
+	if err != nil {
+		return fmt.Errorf("aws sdk Head failed: %v", err)
+	}
+	// fmt.Println(headresp)
 
-	contenttypes, contenttype_present := resp.Header["Content-Type"]
-	cache, cache_present := resp.Header["Cache-Control"]
+	/*
+		resp, err := context.s3.Head(encodedName, make(http.Header))
+		if err != nil {
+			return fmt.Errorf("HEAD failed: %v", err)
+		}
+	*/
+	//contenttypes, contenttype_present := resp.Header["Content-Type"]
+	//cache, cache_present := resp.Header["Cache-Control"]
 
-	var status, contenttype string
+	contenttype := headresp.ContentType
+	oldcachecontrol := headresp.CacheControl
+
+	var status string
 	// . - skip
 	// X - type was not set, set to image/png
 	// j - was image/jpeg; adjusted CacheControl
 	// g - was image/png; adjusted CacheControl
 	// P - pdf file; adjusted CacheControl
 	// Y - other file type; adjusted CacheControl
-	if cache_present && len(cache) == 1 && cache[0] == context.newvalue {
+	if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
 		status = "."
 	} else {
-		if !contenttype_present {
+		if contenttype == nil {
 			status = "X"
-			contenttype = "image/png"
+			contenttype = sdkaws.String("image/png")
 		} else {
-			contenttype = contenttypes[0] // theoretically, there can be multiple HTTP headers with the same key
+			// contenttype = contenttypes[0] // theoretically, there can be multiple HTTP headers with the same key
 			// but lets assume, there is at most one
-			if contenttype == "image/png" {
+			if *contenttype == "image/png" {
 				status = "g"
-			} else if contenttype == "image/jpeg" {
+			} else if *contenttype == "image/jpeg" {
 				status = "j"
-			} else if contenttype == "application/pdf" {
+			} else if *contenttype == "application/pdf" {
 				status = "P"
 			} else {
 				status = "Y"
@@ -168,7 +182,7 @@ func cp(context *CopyContext, name string) error {
 			CopySource:        &src,
 			Key:               &name,
 			CacheControl:      &context.newvalue,
-			ContentType:       &contenttype,
+			ContentType:       contenttype,
 			MetadataDirective: sdkaws.String("REPLACE"),
 		}
 		_, err := context.s3svc.CopyObject(&inp)
