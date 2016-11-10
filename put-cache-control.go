@@ -9,9 +9,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session" // the new library by aws
 	sdks3 "github.com/aws/aws-sdk-go/service/s3"
 	"net/http"
+	"net/url"
 	"os"
 	//	"os/exec"
-	//	"strings"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,10 +110,26 @@ func cpworker(context *CopyContext, names <-chan string) {
 	}
 }
 
+func encodeObjectName(name string) string {
+	/*
+		encodedName := url.QueryEscape(name)
+	*/
+
+	// Do not encode '/'
+	parts := strings.Split(name, "/")
+	for i := range parts {
+		parts[i] = url.QueryEscape(parts[i])
+	}
+	return strings.Join(parts, "/")
+}
+
 func cp(context *CopyContext, name string) error {
-	resp, err := context.s3.Head(name, make(http.Header))
+	encodedName := encodeObjectName(name)
+	fmt.Println(encodedName)
+
+	resp, err := context.s3.Head(encodedName, make(http.Header))
 	if err != nil {
-		return fmt.Errorf("HEAD failed for '%s' Error: %v", name, err)
+		return fmt.Errorf("HEAD failed: %v", err)
 	}
 
 	contenttypes, contenttype_present := resp.Header["Content-Type"]
@@ -145,7 +162,7 @@ func cp(context *CopyContext, name string) error {
 			}
 		}
 
-		src := fmt.Sprintf("%s/%s", context.bucketname, name)
+		src := fmt.Sprintf("%s/%s", context.bucketname, encodedName)
 		inp := sdks3.CopyObjectInput{
 			Bucket:            sdkaws.String(context.bucketname),
 			CopySource:        &src,
