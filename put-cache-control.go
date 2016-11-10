@@ -102,6 +102,16 @@ func cp(context *CopyContext, name string) {
 	resp, err := context.s3.Head(name, make(http.Header))
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("==> Head failed for '%s' Error: %s\n", name, err.Error()))
+		filename := "error_keys.txt"
+		os.Stderr.WriteString(fmt.Sprintf("Adding file to 'TODO' list '%s'", filename))
+		f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %s\n", filename, err.Error()))
+			panic(err)
+		}
+		fmt.Fprintln(f, name)
+		f.Close()
+		return
 	}
 
 	contenttypes, contenttype_present := resp.Header["Content-Type"]
