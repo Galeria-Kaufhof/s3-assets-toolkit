@@ -3,14 +3,10 @@ package main
 import (
 	"bufio"
 	"fmt"
-	sdkaws "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session" // the new library by aws
-	sdks3 "github.com/aws/aws-sdk-go/service/s3"
-	// "net/http"
-	// "net/url"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"os"
-	//	"os/exec"
-	// "strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,7 +14,9 @@ import (
 
 func main() {
 	context, _ := prepareContext()
-	parallelity := 10
+	parallelity := 200 // set well below the typical ulimit of 1024
+	// to avoid "socket: too many open files".
+	// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
 
 	names := make(chan string)
 
@@ -38,7 +36,7 @@ func main() {
 }
 
 type CopyContext struct {
-	s3svc      *sdks3.S3
+	s3svc      *s3.S3
 	bucketname string
 	newvalue   string
 
@@ -54,8 +52,8 @@ type CopyContext struct {
 
 func prepareContext() (CopyContext, error) {
 	// Session with the new library
-	sess, err := session.NewSession(&sdkaws.Config{
-		Region: sdkaws.String("eu-central-1")},
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("eu-central-1")},
 	)
 	if err != nil {
 		panic(fmt.Sprintf("Can not create AWS SDK session %s", err))
@@ -65,7 +63,7 @@ func prepareContext() (CopyContext, error) {
 		panic("Please provide bucket name and desired Cache-Control setting")
 	}
 	return CopyContext{
-		s3svc:           sdks3.New(sess),
+		s3svc:           s3.New(sess),
 		bucketname:      os.Args[1],
 		expectedObjects: 18000000,
 		newvalue:        os.Args[2],
@@ -99,9 +97,9 @@ func cpworker(context *CopyContext, names <-chan string) {
 }
 
 func cp(context *CopyContext, name string) error {
-	headin := sdks3.HeadObjectInput{
-		Bucket: sdkaws.String(context.bucketname),
-		Key:    sdkaws.String(name),
+	headin := s3.HeadObjectInput{
+		Bucket: aws.String(context.bucketname),
+		Key:    aws.String(name),
 	}
 	headresp, err := context.s3svc.HeadObject(&headin)
 	if err != nil {
@@ -123,7 +121,7 @@ func cp(context *CopyContext, name string) error {
 	} else {
 		if contenttype == nil {
 			status = "X"
-			contenttype = sdkaws.String("image/png")
+			contenttype = aws.String("image/png")
 		} else {
 			// contenttype = contenttypes[0] // theoretically, there can be multiple HTTP headers with the same key
 			// but lets assume, there is at most one
@@ -139,13 +137,13 @@ func cp(context *CopyContext, name string) error {
 		}
 
 		src := fmt.Sprintf("%s/%s", context.bucketname, name)
-		inp := sdks3.CopyObjectInput{
-			Bucket:            sdkaws.String(context.bucketname),
+		inp := s3.CopyObjectInput{
+			Bucket:            aws.String(context.bucketname),
 			CopySource:        &src,
 			Key:               &name,
 			CacheControl:      &context.newvalue,
 			ContentType:       contenttype,
-			MetadataDirective: sdkaws.String("REPLACE"),
+			MetadataDirective: aws.String("REPLACE"),
 		}
 		_, err := context.s3svc.CopyObject(&inp)
 		if err != nil {
