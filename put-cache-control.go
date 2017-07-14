@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -65,7 +66,7 @@ func prepareContext() (CopyContext, error) {
 	return CopyContext{
 		s3svc:           s3.New(sess),
 		bucketname:      os.Args[1],
-		expectedObjects: 18000000,
+		expectedObjects: 3867874,
 		newvalue:        os.Args[2],
 		start:           time.Now(),
 	}, nil
@@ -97,9 +98,12 @@ func cpworker(context *CopyContext, names <-chan string) {
 }
 
 func cp(context *CopyContext, name string) error {
+	//fmt.Println(context.bucketname)
+	//fmt.Println(url.PathEscape(name))
 	headin := s3.HeadObjectInput{
 		Bucket: aws.String(context.bucketname),
 		Key:    aws.String(name),
+		//		Key:    aws.String(url.PathEscape(name)),
 	}
 	headresp, err := context.s3svc.HeadObject(&headin)
 	if err != nil {
@@ -136,7 +140,7 @@ func cp(context *CopyContext, name string) error {
 			}
 		}
 
-		src := fmt.Sprintf("%s/%s", context.bucketname, name)
+		src := fmt.Sprintf("%s/%s", context.bucketname, url.PathEscape(name))
 		inp := s3.CopyObjectInput{
 			Bucket:            aws.String(context.bucketname),
 			CopySource:        &src,
