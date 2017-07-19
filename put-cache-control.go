@@ -1,3 +1,4 @@
+/* put-cache-control copies objects in S3 bucket in-place, modifying the meta data, e.g. Cache-Control headers */
 package main
 
 import (
@@ -36,6 +37,11 @@ func main() {
 	fmt.Printf("\nDone.\n")
 }
 
+/* Hello world */
+func CheckPublicCommentTmp() {
+}
+
+/* CopyContext defines context for running concurrent copy operations and remembers the progress */
 type CopyContext struct {
 	s3svc      *s3.S3
 	bucketname string
