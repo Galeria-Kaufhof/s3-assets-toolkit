@@ -7,12 +7,64 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/jessevdk/go-flags"
 	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+/*
+flags:
+
+
+
+*/
+
+type Opts struct {
+	TargetBucket string `short: "t", long: "target-bucket"`
+
+	InPlace    bool   `long: "in-place"`
+	FromBucket string `long: "from-bucket"`
+	// TODO validation - Please provide the source of the objects. Either --in-place or --from-bucket must be specified. Or use InPlace as the default for FromBucket
+	SetCacheControl `long: "set-cache-control"`
+	// cache for one year - so almost forever
+	SetCacheControlForever `long: "set-cache-control-forever"`
+}
+
+var opts Opts
+
+// modify aws s3 copy args in place
+func args_src_copy_from(key string, opts Opts, input *s3.CopyObjectInput) {
+	input.SetCopySource(aws.String(fromBucket + key))
+}
+
+// modify aws s3 copy args in place,
+// set cache-control
+func args_src_cache_control(opts Opts, input *s3.CopyObjectInput) {
+}
+
+// modify aws s3 copy args in place,
+// gather existing object meta data, especially content type
+func args_src_existing_meta(opts Opts, input *s3.CopyObjectInput) {
+}
+
+func copy(object string, opts Opts) {
+	prepareCopy(object, Opts)
+	svc := s3.New(session.New())
+}
+
+func prepareCopy(key string, opts Opts) {
+	object = load_existing_metadata(key)
+	input := &s3.CopyObjectInput{
+		Bucket: aws.String(opts.TargetBucket),
+		Key:    aws.String(key),
+	}
+	args_src_copy_from(key, opts, input)
+	args_src_cache_control(object, opts, input)
+	args_src_existing_meta(object, opts, input)
+}
 
 func main() {
 	context, _ := prepareContext()
