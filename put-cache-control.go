@@ -5,9 +5,11 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/jessevdk/go-flags"
+	flags "github.com/jessevdk/go-flags"
+	"gopkg.in/urfave/cli.v1"
 	"net/url"
 	"os"
 	"sync"
@@ -28,16 +30,16 @@ type Opts struct {
 	InPlace    bool   `long: "in-place"`
 	FromBucket string `long: "from-bucket"`
 	// TODO validation - Please provide the source of the objects. Either --in-place or --from-bucket must be specified. Or use InPlace as the default for FromBucket
-	SetCacheControl `long: "set-cache-control"`
+	SetCacheControl string `long: "set-cache-control" default:"max-age=31536000,public"`
 	// cache for one year - so almost forever
-	SetCacheControlForever `long: "set-cache-control-forever"`
+	SetCacheControlForever string `long: "set-cache-control-forever"`
 }
 
 var opts Opts
 
 // modify aws s3 copy args in place
 func args_src_copy_from(key string, opts Opts, input *s3.CopyObjectInput) {
-	input.SetCopySource(aws.String(fromBucket + key))
+	input.SetCopySource(opts.FromBucket + key)
 }
 
 // modify aws s3 copy args in place,
@@ -51,22 +53,89 @@ func args_src_existing_meta(opts Opts, input *s3.CopyObjectInput) {
 }
 
 func copy(object string, opts Opts) {
-	prepareCopy(object, Opts)
-	svc := s3.New(session.New())
+	prepareCopy(object, opts)
+	// svc := s3.New(session.New())
 }
 
 func prepareCopy(key string, opts Opts) {
-	object = load_existing_metadata(key)
-	input := &s3.CopyObjectInput{
-		Bucket: aws.String(opts.TargetBucket),
-		Key:    aws.String(key),
+	/*
+		object := load_existing_metadata(key)
+		input := &s3.CopyObjectInput{
+			Bucket: aws.String(opts.TargetBucket),
+			Key:    aws.String(key),
+		}
+		args_src_copy_from(key, opts, input)
+		args_src_cache_control(object, opts, input)
+		args_src_existing_meta(object, opts, input)
+	*/
+}
+
+func listObjectsToCopy(bucketname string, context CopyContext) {
+	input := &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucketname),
+		MaxKeys: aws.Int64(100),
 	}
-	args_src_copy_from(key, opts, input)
-	args_src_cache_control(object, opts, input)
-	args_src_existing_meta(object, opts, input)
+
+	result, err := context.s3svc.ListObjectsV2(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case s3.ErrCodeNoSuchBucket:
+				fmt.Println(s3.ErrCodeNoSuchBucket, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return
+	}
+	for _, _ = range result.Contents {
+		fmt.Print(".")
+	}
+	// fmt.Println(result)
+
+	pageNum := 0
+	err = context.s3svc.ListObjectsV2Pages(input,
+		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+			pageNum++
+			// fmt.Println(page)
+			for _, _ = range page.Contents {
+				fmt.Print(".")
+			}
+			return pageNum <= 10
+		})
 }
 
 func main() {
+
+	app := cli.NewApp()
+	app.Usage = "Set Cache-Control header for all objects in a s3 bucket. Optionally copies objects from another bucket."
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name: "target-bucket, t",
+		},
+		cli.StringFlag{
+			Name: "from-bucket, f",
+		},
+		cli.StringFlag{
+			Name:  "cache-control, c",
+			Value: "max-age=31536000,public",
+			Usage: "by default cache for one year",
+		},
+	}
+	app.Action = func(c *cli.Context) error {
+		context, _ := prepareContextFromCli(c)
+		listObjectsToCopy(context.from, context)
+		return nil
+	}
+	app.Run(os.Args)
+
+	return
+
+	flags.Parse(&opts)
 	context, _ := prepareContext()
 	parallelity := 200 // set well below the typical ulimit of 1024
 	// to avoid "socket: too many open files".
@@ -96,7 +165,8 @@ func CheckPublicCommentTmp() {
 /* CopyContext defines context for running concurrent copy operations and remembers the progress */
 type CopyContext struct {
 	s3svc      *s3.S3
-	bucketname string
+	bucketname string // TODO: rename to target
+	from       string
 	newvalue   string
 
 	copiedObjects   int64
@@ -111,9 +181,9 @@ type CopyContext struct {
 
 func prepareContext() (CopyContext, error) {
 	// Session with the new library
-	sess, err := session.NewSession(&aws.Config{
+	sess, err := session.NewSession() /*&aws.Config{
 		Region: aws.String("eu-central-1")},
-	)
+	)*/
 	if err != nil {
 		panic(fmt.Sprintf("Can not create AWS SDK session %s", err))
 	}
@@ -126,6 +196,38 @@ func prepareContext() (CopyContext, error) {
 		bucketname:      os.Args[1],
 		expectedObjects: 3867874,
 		newvalue:        os.Args[2],
+		start:           time.Now(),
+	}, nil
+}
+
+func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
+	// Session with the new library
+	sess, err := session.NewSession() /*&aws.Config{
+		Region: aws.String("eu-central-1")},
+	)*/
+	if err != nil {
+		panic(fmt.Sprintf("Can not create AWS SDK session %s", err))
+	}
+
+	target := c.GlobalString("target-bucket")
+	if target == "" {
+		cli.ShowAppHelp(c)
+		return CopyContext{}, cli.NewExitError("\n\nError: --target-bucket is a required flag\n", 1)
+	}
+
+	from := c.GlobalString("from-bucket")
+	if from == "" {
+		from = target
+	}
+
+	fmt.Printf("Copying   to %s\nCopying from %s\n", target, from)
+
+	return CopyContext{
+		s3svc:           s3.New(sess),
+		bucketname:      target,
+		from:            from,
+		expectedObjects: 3867874,
+		newvalue:        c.GlobalString("cache-control"),
 		start:           time.Now(),
 	}, nil
 }
