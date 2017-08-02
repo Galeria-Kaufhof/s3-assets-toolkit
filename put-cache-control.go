@@ -1,4 +1,3 @@
-/* put-cache-control copies objects in S3 bucket in-place, modifying the meta data, e.g. Cache-Control headers */
 package main
 
 import (
@@ -8,7 +7,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	flags "github.com/jessevdk/go-flags"
 	"gopkg.in/urfave/cli.v1"
 	"net/url"
 	"os"
@@ -16,13 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-/*
-flags:
-
-
-
-*/
 
 type Opts struct {
 	TargetBucket string `short: "t", long: "target-bucket"`
@@ -135,7 +126,6 @@ func main() {
 
 	return
 
-	flags.Parse(&opts)
 	context, _ := prepareContext()
 	parallelity := 200 // set well below the typical ulimit of 1024
 	// to avoid "socket: too many open files".
