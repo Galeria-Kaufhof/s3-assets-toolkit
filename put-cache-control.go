@@ -61,10 +61,17 @@ func prepareCopy(key string, opts Opts) {
 	*/
 }
 
-func listObjectsToCopy(bucketname string, context CopyContext) {
+func listObjectsFromStdin(names chan<- string, bucketname string, context CopyContext) {
+	input := bufio.NewScanner(os.Stdin)
+	for input.Scan() {
+		names <- input.Text()
+	}
+}
+
+func listObjectsToCopy(names chan<- string, bucketname string, context CopyContext) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
-		MaxKeys: aws.Int64(100),
+		MaxKeys: aws.Int64(20),
 	}
 
 	result, err := context.s3svc.ListObjectsV2(input)
@@ -84,7 +91,7 @@ func listObjectsToCopy(bucketname string, context CopyContext) {
 		return
 	}
 	for _, _ = range result.Contents {
-		fmt.Print(".")
+		fmt.Print("W")
 	}
 	// fmt.Println(result)
 
@@ -93,10 +100,11 @@ func listObjectsToCopy(bucketname string, context CopyContext) {
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			pageNum++
 			// fmt.Println(page)
-			for _, _ = range page.Contents {
-				fmt.Print(".")
+			for _, item := range page.Contents {
+				// fmt.Printf("Key: %s ETag: %s\n", *item.Key, *item.ETag)
+				names <- *item.Key
 			}
-			return pageNum <= 10
+			return pageNum <= 5
 		})
 }
 
@@ -116,36 +124,31 @@ func main() {
 			Value: "max-age=31536000,public",
 			Usage: "by default cache for one year",
 		},
+		cli.StringFlag{
+			Name:  "exclude-pictures, e",
+			Value: "max-age=31536000,public",
+			Usage: "do not process picture object which names match regex",
+		},
 	}
 	app.Action = func(c *cli.Context) error {
 		context, _ := prepareContextFromCli(c)
-		listObjectsToCopy(context.from, context)
+
+		parallelity := 200 // set well below the typical ulimit of 1024
+		// to avoid "socket: too many open files".
+		// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
+		names := make(chan string)
+		context.wg.Add(parallelity)
+		for gr := 1; gr <= parallelity; gr++ {
+			go cpworker(&context, names)
+		}
+
+		listObjectsToCopy(names, context.from, context)
+		close(names)
+		context.wg.Wait()
+		fmt.Printf("\nDone.\n")
 		return nil
 	}
 	app.Run(os.Args)
-
-	return
-
-	context, _ := prepareContext()
-	parallelity := 200 // set well below the typical ulimit of 1024
-	// to avoid "socket: too many open files".
-	// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
-
-	names := make(chan string)
-
-	context.wg.Add(parallelity)
-	for gr := 1; gr <= parallelity; gr++ {
-		go cpworker(&context, names)
-	}
-
-	input := bufio.NewScanner(os.Stdin)
-	for input.Scan() {
-		names <- input.Text()
-	}
-	close(names)
-
-	context.wg.Wait()
-	fmt.Printf("\nDone.\n")
 }
 
 /* Hello world */
@@ -158,6 +161,7 @@ type CopyContext struct {
 	bucketname string // TODO: rename to target
 	from       string
 	newvalue   string
+	exclude    string
 
 	copiedObjects   int64
 	copiedBytes     int64
@@ -218,6 +222,7 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		from:            from,
 		expectedObjects: 3867874,
 		newvalue:        c.GlobalString("cache-control"),
+		exclude:         c.GlobalString("exclude-pictures"),
 		start:           time.Now(),
 	}, nil
 }
