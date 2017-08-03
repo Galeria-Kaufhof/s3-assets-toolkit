@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"gopkg.in/urfave/cli.v1"
 	"net/url"
 	"os"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,29 +74,8 @@ func listObjectsToCopy(names chan<- string, bucketname string, context CopyConte
 		MaxKeys: aws.Int64(20),
 	}
 
-	result, err := context.s3svc.ListObjectsV2(input)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case s3.ErrCodeNoSuchBucket:
-				fmt.Println(s3.ErrCodeNoSuchBucket, aerr.Error())
-			default:
-				fmt.Println(aerr.Error())
-			}
-		} else {
-			// Print the error, cast err to awserr.Error to get the Code and
-			// Message from an error.
-			fmt.Println(err.Error())
-		}
-		return
-	}
-	for _, _ = range result.Contents {
-		fmt.Print("W")
-	}
-	// fmt.Println(result)
-
 	pageNum := 0
-	err = context.s3svc.ListObjectsV2Pages(input,
+	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			pageNum++
 			// fmt.Println(page)
@@ -106,6 +85,9 @@ func listObjectsToCopy(names chan<- string, bucketname string, context CopyConte
 			}
 			return pageNum <= 5
 		})
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("%s", err))
+	}
 }
 
 func main() {
@@ -126,7 +108,6 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "exclude-pictures, e",
-			Value: "max-age=31536000,public",
 			Usage: "do not process picture object which names match regex",
 		},
 	}
@@ -151,17 +132,16 @@ func main() {
 	app.Run(os.Args)
 }
 
-/* Hello world */
 func CheckPublicCommentTmp() {
 }
 
 /* CopyContext defines context for running concurrent copy operations and remembers the progress */
 type CopyContext struct {
-	s3svc      *s3.S3
-	bucketname string // TODO: rename to target
-	from       string
-	newvalue   string
-	exclude    string
+	s3svc    *s3.S3
+	target   string
+	from     string
+	newvalue string
+	exclude  regexp.Regexp
 
 	copiedObjects   int64
 	copiedBytes     int64
@@ -187,7 +167,7 @@ func prepareContext() (CopyContext, error) {
 	}
 	return CopyContext{
 		s3svc:           s3.New(sess),
-		bucketname:      os.Args[1],
+		target:          os.Args[1],
 		expectedObjects: 3867874,
 		newvalue:        os.Args[2],
 		start:           time.Now(),
@@ -216,13 +196,17 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 
 	fmt.Printf("Copying   to %s\nCopying from %s\n", target, from)
 
+	exclude_pattern := c.GlobalString("exclude-pictures")
+	if exclude_pattern == "" {
+		exclude_pattern = "^some-pattern-which-would-never-match$"
+	}
 	return CopyContext{
 		s3svc:           s3.New(sess),
-		bucketname:      target,
+		target:          target,
 		from:            from,
 		expectedObjects: 3867874,
 		newvalue:        c.GlobalString("cache-control"),
-		exclude:         c.GlobalString("exclude-pictures"),
+		exclude:         *regexp.MustCompile(exclude_pattern),
 		start:           time.Now(),
 	}, nil
 }
@@ -253,29 +237,33 @@ func cpworker(context *CopyContext, names <-chan string) {
 }
 
 func cp(context *CopyContext, name string) error {
-	//fmt.Println(context.bucketname)
+	//fmt.Println(context.target)
 	//fmt.Println(url.PathEscape(name))
+	// key := aws.String(url.PathEscape(name)),
+	key := name
 	headin := s3.HeadObjectInput{
-		Bucket: aws.String(context.bucketname),
-		Key:    aws.String(name),
-		//		Key:    aws.String(url.PathEscape(name)),
+		Bucket: aws.String(context.from),
+		Key:    aws.String(key),
 	}
 	headresp, err := context.s3svc.HeadObject(&headin)
 	if err != nil {
-		return fmt.Errorf("aws sdk Head failed: %v", err)
+		return fmt.Errorf("aws sdk Head for `%s` failed: %v", key, err)
 	}
 
 	contenttype := headresp.ContentType
 	oldcachecontrol := headresp.CacheControl
 
 	var status string
+	// I - ignore due pattern
 	// . - skip
 	// X - type was not set, set to image/png
 	// j - was image/jpeg; adjusted CacheControl
 	// g - was image/png; adjusted CacheControl
 	// P - pdf file; adjusted CacheControl
 	// Y - other file type; adjusted CacheControl
-	if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
+	if context.exclude.MatchString(name) {
+		status = "I"
+	} else if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
 		status = "."
 	} else {
 		if contenttype == nil {
@@ -295,9 +283,9 @@ func cp(context *CopyContext, name string) error {
 			}
 		}
 
-		src := fmt.Sprintf("%s/%s", context.bucketname, url.PathEscape(name))
+		src := fmt.Sprintf("%s/%s", context.from, url.PathEscape(name))
 		inp := s3.CopyObjectInput{
-			Bucket:            aws.String(context.bucketname),
+			Bucket:            aws.String(context.target),
 			CopySource:        &src,
 			Key:               &name,
 			CacheControl:      &context.newvalue,
