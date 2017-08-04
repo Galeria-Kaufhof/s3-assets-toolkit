@@ -71,7 +71,7 @@ func listObjectsFromStdin(names chan<- string, bucketname string, context CopyCo
 func listObjectsToCopy(names chan<- string, bucketname string, context CopyContext) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
-		MaxKeys: aws.Int64(20),
+		MaxKeys: aws.Int64(1000),
 	}
 
 	pageNum := 0
@@ -83,7 +83,7 @@ func listObjectsToCopy(names chan<- string, bucketname string, context CopyConte
 				// fmt.Printf("Key: %s ETag: %s\n", *item.Key, *item.ETag)
 				names <- *item.Key
 			}
-			return pageNum <= 5
+			return pageNum <= 10
 		})
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("%s", err))
@@ -236,22 +236,32 @@ func cpworker(context *CopyContext, names <-chan string) {
 	}
 }
 
+func IsPicture(meta *s3.HeadObjectOutput) bool {
+	switch *meta.ContentType {
+	case
+		"image/jpeg",
+		"image/png":
+		return true
+	default:
+		return false
+	}
+}
+
 func cp(context *CopyContext, name string) error {
 	//fmt.Println(context.target)
 	//fmt.Println(url.PathEscape(name))
 	// key := aws.String(url.PathEscape(name)),
 	key := name
-	headin := s3.HeadObjectInput{
+	from, err := context.s3svc.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(context.from),
 		Key:    aws.String(key),
-	}
-	headresp, err := context.s3svc.HeadObject(&headin)
+	})
 	if err != nil {
-		return fmt.Errorf("aws sdk Head for `%s` failed: %v", key, err)
+		return fmt.Errorf("\naws sdk Head for `%s` failed: \n%T\n%v\n", key, err, err)
 	}
 
-	contenttype := headresp.ContentType
-	oldcachecontrol := headresp.CacheControl
+	contenttype := from.ContentType
+	oldcachecontrol := from.CacheControl
 
 	var status string
 	// I - ignore due pattern
@@ -261,7 +271,7 @@ func cp(context *CopyContext, name string) error {
 	// g - was image/png; adjusted CacheControl
 	// P - pdf file; adjusted CacheControl
 	// Y - other file type; adjusted CacheControl
-	if context.exclude.MatchString(name) {
+	if context.exclude.MatchString(name) && IsPicture(from) {
 		status = "I"
 	} else if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
 		status = "."
