@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"gopkg.in/urfave/cli.v1"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
@@ -68,22 +69,19 @@ func listObjectsFromStdin(names chan<- string, bucketname string, context CopyCo
 	}
 }
 
-func listObjectsToCopy(names chan<- string, bucketname string, context CopyContext) {
+func listObjectsToCopy(names chan<- string, bucketname string, context *CopyContext) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
-		MaxKeys: aws.Int64(1000),
+		MaxKeys: aws.Int64(20),
 	}
 
-	pageNum := 0
 	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-			pageNum++
-			// fmt.Println(page)
 			for _, item := range page.Contents {
-				// fmt.Printf("Key: %s ETag: %s\n", *item.Key, *item.ETag)
 				names <- *item.Key
 			}
-			return pageNum <= 10
+			// stop pumping names once we have copied enough
+			return context.copiedObjects < context.maxObjectsToCopy
 		})
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("%s", err))
@@ -94,12 +92,15 @@ func main() {
 
 	app := cli.NewApp()
 	app.Usage = "Set Cache-Control header for all objects in a s3 bucket. Optionally copies objects from another bucket."
+	app.Version = "0.1"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
-			Name: "target-bucket, t",
+			Name:  "target-bucket, t",
+			Usage: "where changes will happen: objects added or meta-data changed",
 		},
 		cli.StringFlag{
-			Name: "from-bucket, f",
+			Name:  "from-bucket, f",
+			Usage: "if omitted, use in-place-copy (target-bucket=from-bucket)",
 		},
 		cli.StringFlag{
 			Name:  "cache-control, c",
@@ -109,6 +110,11 @@ func main() {
 		cli.StringFlag{
 			Name:  "exclude-pictures, e",
 			Usage: "do not process picture object which names match regex",
+		},
+		cli.IntFlag{
+			Name:  "first-n, n",
+			Value: math.MaxInt64,
+			Usage: "stop copy/process roughly after first n entries; skipped\n\tand ignored do not count",
 		},
 	}
 	app.Action = func(c *cli.Context) error {
@@ -123,7 +129,7 @@ func main() {
 			go cpworker(&context, names)
 		}
 
-		listObjectsToCopy(names, context.from, context)
+		listObjectsToCopy(names, context.from, &context)
 		close(names)
 		context.wg.Wait()
 		fmt.Printf("\nDone.\n")
@@ -143,12 +149,14 @@ type CopyContext struct {
 	newvalue string
 	exclude  regexp.Regexp
 
-	copiedObjects   int64
-	copiedBytes     int64
-	expectedObjects int64
-	start           time.Time
-	statusLineMutex sync.Mutex
-	lastStatusShown float64
+	copiedObjects    int64
+	maxObjectsToCopy int64
+	processedObjects int64 // including ignored and skipped
+	copiedBytes      int64
+	expectedObjects  int64
+	start            time.Time
+	statusLineMutex  sync.Mutex
+	lastStatusShown  float64
 
 	wg sync.WaitGroup
 }
@@ -201,13 +209,14 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		exclude_pattern = "^some-pattern-which-would-never-match$"
 	}
 	return CopyContext{
-		s3svc:           s3.New(sess),
-		target:          target,
-		from:            from,
-		expectedObjects: 3867874,
-		newvalue:        c.GlobalString("cache-control"),
-		exclude:         *regexp.MustCompile(exclude_pattern),
-		start:           time.Now(),
+		s3svc:            s3.New(sess),
+		target:           target,
+		from:             from,
+		expectedObjects:  0,
+		maxObjectsToCopy: c.GlobalInt64("first-n"),
+		newvalue:         c.GlobalString("cache-control"),
+		exclude:          *regexp.MustCompile(exclude_pattern),
+		start:            time.Now(),
 	}, nil
 }
 
@@ -275,6 +284,8 @@ func cp(context *CopyContext, name string) error {
 		status = "I"
 	} else if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
 		status = "."
+	} else if context.copiedObjects > context.maxObjectsToCopy {
+		status = ","
 	} else {
 		if contenttype == nil {
 			status = "X"
@@ -306,13 +317,14 @@ func cp(context *CopyContext, name string) error {
 		if err != nil {
 			return fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
 		}
+		atomic.AddInt64(&context.copiedObjects, 1)
 	}
 	fmt.Print(status)
 
-	atomic.AddInt64(&context.copiedObjects, 1)
+	atomic.AddInt64(&context.processedObjects, 1)
 	sec := time.Since(context.start).Seconds()
-	o_s := float64(context.copiedObjects) / sec
-	expectedDuration := time.Duration(int(float64(context.expectedObjects-context.copiedObjects)/o_s)) * time.Second
+	o_s := float64(context.processedObjects) / sec
+	expectedDuration := time.Duration(int(float64(context.expectedObjects-context.processedObjects)/o_s)) * time.Second
 	days := int(expectedDuration.Hours() / 24)
 	andHours := expectedDuration.Hours() - float64(days)*24
 	eta := fmt.Sprintf("%dd %.1fh", days, andHours)
@@ -321,7 +333,7 @@ func cp(context *CopyContext, name string) error {
 		andMinutes := expectedDuration.Minutes() - float64(hours)*60
 		eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
 	}
-	if context.expectedObjects < context.copiedObjects {
+	if context.expectedObjects < context.processedObjects {
 		eta = "-"
 	}
 
@@ -336,7 +348,7 @@ func cp(context *CopyContext, name string) error {
 
 	if show {
 		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
-			name, context.copiedObjects, context.expectedObjects, o_s, eta,
+			name, context.processedObjects, context.expectedObjects, o_s, eta,
 		)
 	}
 	return nil
