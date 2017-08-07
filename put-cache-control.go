@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"gopkg.in/urfave/cli.v1"
 	"math"
 	"net/url"
@@ -62,6 +65,82 @@ func prepareCopy(key string, opts Opts) {
 	*/
 }
 
+func assumeRoleCrossAccount(role string) (*aws.Config, error) {
+	security := sts.New(session.New())
+	input := &sts.AssumeRoleInput{
+		DurationSeconds: aws.Int64(3600),
+		ExternalId:      aws.String("123ABC"),
+		RoleArn:         &role,
+		RoleSessionName: aws.String("PutCacheControlImpersonification"),
+	}
+	impersonated, err := security.AssumeRole(input)
+	if err != nil {
+		return nil, fmt.Errorf("assume role '%s' for cross-account access failed: %v", role, err)
+	}
+
+	c := *impersonated.Credentials
+	tmpCreds := credentials.NewStaticCredentials(*c.AccessKeyId, *c.SecretAccessKey, *c.SessionToken)
+	return aws.NewConfig().WithCredentials(tmpCreds), nil
+}
+
+// Find out the number of objects in the bucket
+// func getBucketSize(svc cloudwatch.CloudWatch) (int64, error) {
+func getBucketSize(bucketName string, conf *aws.Config) (int64, error) {
+	svcCrossAccount := cloudwatch.New(session.New(), conf)
+	dims := []*cloudwatch.Dimension{
+		&cloudwatch.Dimension{Name: aws.String("BucketName"), Value: aws.String(bucketName)},
+		&cloudwatch.Dimension{Name: aws.String("StorageType"), Value: aws.String("AllStorageTypes")},
+	}
+	req := cloudwatch.GetMetricStatisticsInput{
+		Namespace:  aws.String("AWS/S3"),
+		StartTime:  aws.Time(time.Now().Add(-time.Hour * 24 * 3)),
+		EndTime:    aws.Time(time.Now()),
+		Period:     aws.Int64(3600), // TODO try out Period: 86400 (one day)
+		Statistics: []*string{aws.String("Maximum")},
+		MetricName: aws.String("NumberOfObjects"),
+		Dimensions: dims,
+	}
+	resp, err := svcCrossAccount.GetMetricStatistics(&req)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to detect bucket '%s' size: %v", bucketName, err)
+	}
+
+	if len(resp.Datapoints) == 0 {
+		return 0, fmt.Errorf("No object counting for source bucket possible. Remember to give reading user `cloudwatch:GetMetricData` permission on source bucket. And provide --cross-account-cloudwatch-role")
+	}
+	max := 0.0
+	for _, dp := range resp.Datapoints {
+		if *dp.Maximum > max {
+			max = *dp.Maximum
+		}
+	}
+	return int64(max), nil
+}
+
+// Quickly find out the size of the bucket to copy for a nice progress indicator.
+// Side effect: modifies the context
+func getExpectedSize(context *CopyContext) {
+	var err error
+	context.expectedObjects, err = getBucketSize(context.from, &aws.Config{})
+	if err != nil && context.cloudwatchRole != "" {
+		// Retry getBucketSize using assume role (cross-account),
+		// first acquire temporary cross-account credentials (AWS STS)
+		confCrossAccount, errRole := assumeRoleCrossAccount(context.cloudwatchRole)
+		if errRole != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed to detect 'from' bucket size: %v\n", errRole))
+			context.expectedObjects = 0 // unknown
+			return
+		}
+		context.expectedObjects, err = getBucketSize(context.from, confCrossAccount)
+	}
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("Failed to detect 'from' bucket size: %v\n", err))
+		context.expectedObjects = 0 // unknown
+		return
+	}
+	fmt.Printf("Objects to copy/check: %d\n", context.expectedObjects)
+}
+
 func listObjectsFromStdin(names chan<- string, bucketname string, context CopyContext) {
 	input := bufio.NewScanner(os.Stdin)
 	for input.Scan() {
@@ -72,11 +151,12 @@ func listObjectsFromStdin(names chan<- string, bucketname string, context CopyCo
 func listObjectsToCopy(names chan<- string, bucketname string, context *CopyContext) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
-		MaxKeys: aws.Int64(20),
+		MaxKeys: aws.Int64(1000),
 	}
 
 	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+			atomic.AddInt64(&context.expectedObjects, int64(len(page.Contents)))
 			for _, item := range page.Contents {
 				names <- *item.Key
 			}
@@ -89,7 +169,6 @@ func listObjectsToCopy(names chan<- string, bucketname string, context *CopyCont
 }
 
 func main() {
-
 	app := cli.NewApp()
 	app.Usage = "Set Cache-Control header for all objects in a s3 bucket. Optionally copies objects from another bucket."
 	app.Version = "0.1"
@@ -116,6 +195,19 @@ func main() {
 			Value: math.MaxInt64,
 			Usage: "stop copy/process roughly after first n entries; skipped\n\tand ignored do not count",
 		},
+		cli.StringFlag{
+			Name: "cross-account-cloudwatch-role, r",
+			Usage: `
+
+	Sometimes you need to copy objects between buckets from different accounts
+	(cross-account), e.g. prod- vs. nonprod- account. Obviously you need to give
+	the account you currently use write permission to the target bucket and read
+	permission to the 'from' bucket. But to also have a correct progress bar for
+	the long running copy operation, you need to give your account the permission
+	to access cloudwatch metrics for the 'from' bucket.
+
+			`,
+		},
 	}
 	app.Action = func(c *cli.Context) error {
 		context, _ := prepareContextFromCli(c)
@@ -123,11 +215,13 @@ func main() {
 		parallelity := 200 // set well below the typical ulimit of 1024
 		// to avoid "socket: too many open files".
 		// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
-		names := make(chan string)
+		names := make(chan string, 10000)
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
 			go cpworker(&context, names)
 		}
+
+		getExpectedSize(&context)
 
 		listObjectsToCopy(names, context.from, &context)
 		close(names)
@@ -143,11 +237,12 @@ func CheckPublicCommentTmp() {
 
 /* CopyContext defines context for running concurrent copy operations and remembers the progress */
 type CopyContext struct {
-	s3svc    *s3.S3
-	target   string
-	from     string
-	newvalue string
-	exclude  regexp.Regexp
+	s3svc          *s3.S3
+	target         string
+	from           string
+	newvalue       string
+	exclude        regexp.Regexp
+	cloudwatchRole string
 
 	copiedObjects    int64
 	maxObjectsToCopy int64
@@ -216,6 +311,7 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		maxObjectsToCopy: c.GlobalInt64("first-n"),
 		newvalue:         c.GlobalString("cache-control"),
 		exclude:          *regexp.MustCompile(exclude_pattern),
+		cloudwatchRole:   c.GlobalString("cross-account-cloudwatch-role"),
 		start:            time.Now(),
 	}, nil
 }
