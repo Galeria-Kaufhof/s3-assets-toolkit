@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
@@ -370,33 +371,67 @@ func IsPicture(meta *s3.HeadObjectOutput) bool {
 	}
 }
 
+func str(o *s3.HeadObjectOutput) string {
+	if o == nil {
+		return "NotFound"
+	} else {
+		cache, ctype := "nil", "nil"
+		if o.CacheControl != nil {
+			cache = *o.CacheControl
+		}
+		if o.ContentType != nil {
+			ctype = *o.ContentType
+		}
+		return fmt.Sprintf("%s, %s", cache, ctype)
+	}
+}
+
 func cp(context *CopyContext, name string) error {
 	//fmt.Println(context.target)
 	//fmt.Println(url.PathEscape(name))
 	// key := aws.String(url.PathEscape(name)),
 	key := name
-	from, err := context.s3svc.HeadObject(&s3.HeadObjectInput{
+	from, fromErr := context.s3svc.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(context.from),
 		Key:    aws.String(key),
 	})
-	if err != nil {
-		return fmt.Errorf("\naws sdk Head for `%s` failed: \n%T\n%v\n", key, err, err)
+	if fromErr != nil {
+		return fmt.Errorf("\naws sdk Head for `%s` failed: \n%T\n%v\n", key, fromErr, fromErr)
 	}
 
 	contenttype := from.ContentType
-	oldcachecontrol := from.CacheControl
+
+	target, targetErr := context.s3svc.HeadObject(&s3.HeadObjectInput{
+		Bucket: aws.String(context.target),
+		Key:    aws.String(key),
+	})
+	if targetErr != nil {
+		if aerr, ok := targetErr.(awserr.Error); ok {
+			switch aerr.Code() {
+			case "NotFound":
+				target = nil
+			default:
+				os.Stderr.WriteString(fmt.Sprintf("\n***Missing target Head for `%s` failed (code %s): \n%T\n%v\n",
+					key, aerr.Code(), targetErr, targetErr))
+			}
+		} else {
+			return fmt.Errorf("\naws sdk Head for target `%s` failed, can not recognize the aws return code: \n%T\n%v\n",
+				key, fromErr, fromErr)
+		}
+	}
 
 	var status string
-	// I - ignore due pattern
-	// . - skip
+	// E - excluded pattern
+	// . - skip, Cache-Control and Content-Type already set
 	// X - type was not set, set to image/png
 	// j - was image/jpeg; adjusted CacheControl
 	// g - was image/png; adjusted CacheControl
 	// P - pdf file; adjusted CacheControl
 	// Y - other file type; adjusted CacheControl
 	if context.exclude.MatchString(name) && IsPicture(from) {
-		status = "I"
-	} else if oldcachecontrol != nil && *oldcachecontrol == context.newvalue {
+		status = "E"
+	} else if target != nil && target.CacheControl != nil && *target.CacheControl == context.newvalue &&
+		target.ContentType != nil {
 		status = "."
 	} else if context.copiedObjects > context.maxObjectsToCopy {
 		status = ","
@@ -405,6 +440,7 @@ func cp(context *CopyContext, name string) error {
 			status = "X"
 			contenttype = aws.String("image/png")
 		} else {
+			// DEBUG: fmt.Printf("\nkey %s, from: %s target: %s\n", key, str(from), str(target))
 			// contenttype = contenttypes[0] // theoretically, there can be multiple HTTP headers with the same key
 			// but lets assume, there is at most one
 			if *contenttype == "image/png" {
@@ -467,6 +503,7 @@ func cp(context *CopyContext, name string) error {
 	context.statusLineMutex.Unlock()
 
 	if show {
+		context.statusLineMutex.Lock()
 		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
 			name, context.processedObjects, context.expectedObjects, o_s, eta,
 		)
@@ -478,6 +515,7 @@ func cp(context *CopyContext, name string) error {
 		for k, v := range context.statusStats {
 			fmt.Printf("%s %d\n", k, v)
 		}
+		context.statusLineMutex.Unlock()
 	}
 	return nil
 }
