@@ -186,6 +186,11 @@ func main() {
 			Value: "max-age=31536000,public",
 			Usage: "by default cache for one year",
 		},
+		cli.IntFlag{
+			Name:  "parallelity, p",
+			Value: 200,
+			Usage: "number of workers to use",
+		},
 		cli.StringFlag{
 			Name:  "exclude-pictures, e",
 			Usage: "do not process picture object which names match regex",
@@ -212,10 +217,12 @@ func main() {
 	app.Action = func(c *cli.Context) error {
 		context, _ := prepareContextFromCli(c)
 
-		parallelity := 200 // set well below the typical ulimit of 1024
+		// set well below the typical ulimit of 1024 - TODO add to docs
 		// to avoid "socket: too many open files".
 		// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
-		names := make(chan string, 10000)
+		parallelity := c.GlobalInt("parallelity")
+
+		names := make(chan string, 3000)
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
 			go cpworker(&context, names)
