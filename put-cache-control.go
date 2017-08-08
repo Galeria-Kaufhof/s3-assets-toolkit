@@ -259,6 +259,9 @@ type CopyContext struct {
 	start            time.Time
 	statusLineMutex  sync.Mutex
 	lastStatusShown  float64
+	statsMutex       sync.Mutex
+	statusStats      map[string]int
+	typeStats        map[string]int
 
 	wg sync.WaitGroup
 }
@@ -320,6 +323,8 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		exclude:          *regexp.MustCompile(exclude_pattern),
 		cloudwatchRole:   c.GlobalString("cross-account-cloudwatch-role"),
 		start:            time.Now(),
+		statusStats:      make(map[string]int),
+		typeStats:        make(map[string]int),
 	}, nil
 }
 
@@ -423,6 +428,10 @@ func cp(context *CopyContext, name string) error {
 		atomic.AddInt64(&context.copiedObjects, 1)
 	}
 	fmt.Print(status)
+	context.statsMutex.Lock()
+	context.statusStats[status] += 1
+	context.typeStats[*contenttype] += 1
+	context.statsMutex.Unlock()
 
 	atomic.AddInt64(&context.processedObjects, 1)
 	sec := time.Since(context.start).Seconds()
@@ -453,6 +462,14 @@ func cp(context *CopyContext, name string) error {
 		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
 			name, context.processedObjects, context.expectedObjects, o_s, eta,
 		)
+		fmt.Printf("\nContent-Type stats:\n")
+		for k, v := range context.typeStats {
+			fmt.Printf("%s %d\n", k, v)
+		}
+		fmt.Printf("\nCopy status stats:\n")
+		for k, v := range context.statusStats {
+			fmt.Printf("%s %d\n", k, v)
+		}
 	}
 	return nil
 }
