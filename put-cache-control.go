@@ -191,6 +191,10 @@ func main() {
 			Value: 200,
 			Usage: "number of workers to use",
 		},
+		cli.BoolFlag{
+			Name:  "noop",
+			Usage: "make no changes, just gather statistics",
+		},
 		cli.StringFlag{
 			Name:  "exclude-pictures, e",
 			Usage: "do not process picture object which names match regex",
@@ -250,6 +254,7 @@ type CopyContext struct {
 	newvalue       string
 	exclude        regexp.Regexp
 	cloudwatchRole string
+	noop           bool
 
 	copiedObjects    int64
 	maxObjectsToCopy int64
@@ -317,6 +322,7 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		s3svc:            s3.New(sess),
 		target:           target,
 		from:             from,
+		noop:             c.GlobalBool("noop"),
 		expectedObjects:  0,
 		maxObjectsToCopy: c.GlobalInt64("first-n"),
 		newvalue:         c.GlobalString("cache-control"),
@@ -421,9 +427,11 @@ func cp(context *CopyContext, name string) error {
 			ContentType:       contenttype,
 			MetadataDirective: aws.String("REPLACE"),
 		}
-		_, err := context.s3svc.CopyObject(&inp)
-		if err != nil {
-			return fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
+		if !context.noop {
+			_, err := context.s3svc.CopyObject(&inp)
+			if err != nil {
+				return fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
+			}
 		}
 		atomic.AddInt64(&context.copiedObjects, 1)
 	}
