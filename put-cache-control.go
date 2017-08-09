@@ -160,7 +160,8 @@ func listObjectsToCopy(names chan<- string, bucketname string, continueFromKey s
 
 	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-			atomic.AddInt64(&context.expectedObjects, int64(len(page.Contents)))
+			// Could use following if cloudwatch based metrics are not available:
+			// atomic.AddInt64(&context.expectedObjects, int64(len(page.Contents)))
 			for _, item := range page.Contents {
 				names <- *item.Key
 			}
