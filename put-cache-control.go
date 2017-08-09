@@ -503,7 +503,7 @@ func cp(context *CopyContext, name string) error {
 	context.statusLineMutex.Unlock()
 
 	if show {
-		context.statusLineMutex.Lock()
+		context.statsMutex.Lock()
 		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
 			name, context.processedObjects, context.expectedObjects, o_s, eta,
 		)
@@ -515,7 +515,7 @@ func cp(context *CopyContext, name string) error {
 		for k, v := range context.statusStats {
 			fmt.Printf("%s %d\n", k, v)
 		}
-		context.statusLineMutex.Unlock()
+		context.statsMutex.Unlock()
 	}
 	return nil
 }
