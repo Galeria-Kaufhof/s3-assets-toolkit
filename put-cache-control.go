@@ -149,10 +149,13 @@ func listObjectsFromStdin(names chan<- string, bucketname string, context CopyCo
 	}
 }
 
-func listObjectsToCopy(names chan<- string, bucketname string, context *CopyContext) {
+func listObjectsToCopy(names chan<- string, bucketname string, continueFromKey string, context *CopyContext) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
 		MaxKeys: aws.Int64(1000),
+	}
+	if continueFromKey != "" {
+		input.StartAfter = &continueFromKey
 	}
 
 	err := context.s3svc.ListObjectsV2Pages(input,
@@ -206,6 +209,10 @@ func main() {
 			Usage: "stop copy/process roughly after first n entries; skipped\n\tand ignored do not count",
 		},
 		cli.StringFlag{
+			Name:  "continue, u",
+			Usage: "do not start over, continue from given key",
+		},
+		cli.StringFlag{
 			Name: "cross-account-cloudwatch-role, r",
 			Usage: `
 
@@ -235,7 +242,7 @@ func main() {
 
 		getExpectedSize(&context)
 
-		listObjectsToCopy(names, context.from, &context)
+		listObjectsToCopy(names, context.from, c.GlobalString("continue"), &context)
 		close(names)
 		context.wg.Wait()
 		fmt.Printf("\nDone.\n")
