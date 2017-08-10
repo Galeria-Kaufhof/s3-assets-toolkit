@@ -97,7 +97,7 @@ func getExpectedSize(context *CopyContext) {
 	fmt.Printf("Objects to copy/check: %d\n", context.expectedObjects)
 }
 
-func listObjectsFromStdin(names chan<- string, bucketname string, context CopyContext) {
+func listObjectsFromStdin(names chan<- string) {
 	input := bufio.NewScanner(os.Stdin)
 	for input.Scan() {
 		names <- input.Text()
@@ -168,6 +168,10 @@ func main() {
 			Name:  "continue, u",
 			Usage: "do not start over, continue from given key",
 		},
+		cli.BoolFlag{
+			Name:  "stdin",
+			Usage: "take file names to copy from stdin",
+		},
 		cli.StringFlag{
 			Name: "cross-account-cloudwatch-role, r",
 			Usage: `
@@ -197,8 +201,11 @@ func main() {
 		}
 
 		getExpectedSize(&context)
-
-		listObjectsToCopy(names, context.from, c.GlobalString("continue"), &context)
+		if c.GlobalBool("stdin") {
+			listObjectsFromStdin(names)
+		} else {
+			listObjectsToCopy(names, context.from, c.GlobalString("continue"), &context)
+		}
 		close(names)
 		context.wg.Wait()
 		fmt.Printf("\nDone.\n")
