@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -482,7 +483,11 @@ func cp(context *CopyContext, name string) error {
 	fmt.Print(status)
 	context.statsMutex.Lock()
 	context.statusStats[status] += 1
-	context.typeStats[*contenttype] += 1
+	// extract interesting part before semicolon, like "mulitpart/package"
+	// from `multipart/package; boundary="_-------------1437962543790"`
+	ctype := strings.Split(*contenttype, ";")[0]
+	context.typeStats[ctype] += 1
+
 	context.statsMutex.Unlock()
 
 	atomic.AddInt64(&context.processedObjects, 1)
