@@ -21,52 +21,6 @@ import (
 	"time"
 )
 
-type Opts struct {
-	TargetBucket string `short: "t", long: "target-bucket"`
-
-	InPlace    bool   `long: "in-place"`
-	FromBucket string `long: "from-bucket"`
-	// TODO validation - Please provide the source of the objects. Either --in-place or --from-bucket must be specified. Or use InPlace as the default for FromBucket
-	SetCacheControl string `long: "set-cache-control" default:"max-age=31536000,public"`
-	// cache for one year - so almost forever
-	SetCacheControlForever string `long: "set-cache-control-forever"`
-}
-
-var opts Opts
-
-// modify aws s3 copy args in place
-func args_src_copy_from(key string, opts Opts, input *s3.CopyObjectInput) {
-	input.SetCopySource(opts.FromBucket + key)
-}
-
-// modify aws s3 copy args in place,
-// set cache-control
-func args_src_cache_control(opts Opts, input *s3.CopyObjectInput) {
-}
-
-// modify aws s3 copy args in place,
-// gather existing object meta data, especially content type
-func args_src_existing_meta(opts Opts, input *s3.CopyObjectInput) {
-}
-
-func copy(object string, opts Opts) {
-	prepareCopy(object, opts)
-	// svc := s3.New(session.New())
-}
-
-func prepareCopy(key string, opts Opts) {
-	/*
-		object := load_existing_metadata(key)
-		input := &s3.CopyObjectInput{
-			Bucket: aws.String(opts.TargetBucket),
-			Key:    aws.String(key),
-		}
-		args_src_copy_from(key, opts, input)
-		args_src_cache_control(object, opts, input)
-		args_src_existing_meta(object, opts, input)
-	*/
-}
-
 func assumeRoleCrossAccount(role string) (*aws.Config, error) {
 	security := sts.New(session.New())
 	input := &sts.AssumeRoleInput{
