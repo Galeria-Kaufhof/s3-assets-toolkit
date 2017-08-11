@@ -15,7 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strings"
+	_ "strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,10 +195,12 @@ func main() {
 		parallelity := c.GlobalInt("parallelity")
 
 		names := make(chan string, 3000)
+		events := make(chan CopyResult)
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
-			go cpworker(&context, names)
+			go cpworker(&context, names, events)
 		}
+		go processStats(events)
 
 		getExpectedSize(&context)
 		if c.GlobalBool("stdin") {
@@ -209,6 +211,7 @@ func main() {
 		close(names)
 		context.wg.Wait()
 		fmt.Printf("\nDone.\n")
+		// TODO wait for stats processing finished
 		return nil
 	}
 	app.Run(os.Args)
@@ -240,6 +243,20 @@ type CopyContext struct {
 	typeStats        map[string]int
 
 	wg sync.WaitGroup
+}
+
+type CopyOptions struct {
+	target         string
+	from           string
+	newvalue       string
+	exclude        regexp.Regexp
+	cloudwatchRole string
+	noop           bool
+}
+
+type CopyResult struct {
+	status, key, contenttype string
+	err                      error
 }
 
 func prepareContext() (CopyContext, error) {
@@ -305,23 +322,12 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 	}, nil
 }
 
-func cpworker(context *CopyContext, names <-chan string) {
+func cpworker(context *CopyContext, names <-chan string, events chan<- CopyResult) {
 	for {
 		name, more := <-names
 		if more {
 			// fmt.Printf("Starting copy %v\n", name)
-			if err := cp(context, name); err != nil {
-				os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", name, err))
-				filename := "error_keys.txt"
-				os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
-				f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-				if err != nil {
-					os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
-					panic(err)
-				}
-				fmt.Fprintln(f, name)
-				f.Close()
-			}
+			events <- cp(context, name)
 		} else {
 			// fmt.Printf("\nNo more data in names channel.\n")
 			context.wg.Done()
@@ -356,17 +362,19 @@ func str(o *s3.HeadObjectOutput) string {
 	}
 }
 
-func cp(context *CopyContext, name string) error {
+func cp(context *CopyContext, name string) CopyResult {
 	//fmt.Println(context.target)
 	//fmt.Println(url.PathEscape(name))
 	// key := aws.String(url.PathEscape(name)),
 	key := name
+	res := CopyResult{status: "X", key: key}
 	from, fromErr := context.s3svc.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(context.from),
 		Key:    aws.String(key),
 	})
 	if fromErr != nil {
-		return fmt.Errorf("\naws sdk Head for `%s` failed: \n%T\n%v\n", key, fromErr, fromErr)
+		res.err = fmt.Errorf("\naws sdk Head for `%s` failed: \n%T\n%v\n", key, fromErr, fromErr)
+		return res
 	}
 
 	contenttype := from.ContentType
@@ -385,8 +393,9 @@ func cp(context *CopyContext, name string) error {
 					key, aerr.Code(), targetErr, targetErr))
 			}
 		} else {
-			return fmt.Errorf("\naws sdk Head for target `%s` failed, can not recognize the aws return code: \n%T\n%v\n",
+			res.err = fmt.Errorf("\naws sdk Head for target `%s` failed, can not recognize the aws return code: \n%T\n%v\n",
 				key, fromErr, fromErr)
+			return res
 		}
 	}
 
@@ -436,60 +445,90 @@ func cp(context *CopyContext, name string) error {
 		if !context.noop {
 			_, err := context.s3svc.CopyObject(&inp)
 			if err != nil {
-				return fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
+				res.err = fmt.Errorf("Failed changing (inplace-copying) object: %v", err)
+				return res
 			}
 		}
 		atomic.AddInt64(&context.copiedObjects, 1)
 	}
 	fmt.Print(status)
-	context.statsMutex.Lock()
-	context.statusStats[status] += 1
-	// extract interesting part before semicolon, like "mulitpart/package"
-	// from `multipart/package; boundary="_-------------1437962543790"`
-	ctype := strings.Split(*contenttype, ";")[0]
-	context.typeStats[ctype] += 1
 
-	context.statsMutex.Unlock()
-
-	atomic.AddInt64(&context.processedObjects, 1)
-	sec := time.Since(context.start).Seconds()
-	o_s := float64(context.processedObjects) / sec
-	expectedDuration := time.Duration(int(float64(context.expectedObjects-context.processedObjects)/o_s)) * time.Second
-	days := int(expectedDuration.Hours() / 24)
-	andHours := expectedDuration.Hours() - float64(days)*24
-	eta := fmt.Sprintf("%dd %.1fh", days, andHours)
-	if days == 0 {
-		hours := int(expectedDuration.Minutes() / 60)
-		andMinutes := expectedDuration.Minutes() - float64(hours)*60
-		eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
+	if contenttype == nil {
+		res.contenttype = ""
+	} else {
+		res.contenttype = *contenttype
 	}
-	if context.expectedObjects < context.processedObjects {
-		eta = "-"
+	return res
+}
+
+func processStats(events <-chan CopyResult) {
+	for {
+		event, more := <-events
+		if more {
+			if event.err != nil {
+				os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", event.key, event.err))
+				filename := "error_keys.txt"
+				os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
+				f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+				if err != nil {
+					os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
+					panic(err)
+				}
+				fmt.Fprintln(f, event.key)
+				f.Close()
+			}
+		}
 	}
 
-	const everySeconds = 10
-	show := false
-	context.statusLineMutex.Lock()
-	if context.lastStatusShown < sec-everySeconds {
-		show = true
-		context.lastStatusShown = sec
-	}
-	context.statusLineMutex.Unlock()
-
-	if show {
+	/*
 		context.statsMutex.Lock()
-		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
-			name, context.processedObjects, context.expectedObjects, o_s, eta,
-		)
-		fmt.Printf("\nContent-Type stats:\n")
-		for k, v := range context.typeStats {
-			fmt.Printf("%s %d\n", k, v)
-		}
-		fmt.Printf("\nCopy status stats:\n")
-		for k, v := range context.statusStats {
-			fmt.Printf("%s %d\n", k, v)
-		}
+		context.statusStats[status] += 1
+		// extract interesting part before semicolon, like "mulitpart/package"
+		// from `multipart/package; boundary="_-------------1437962543790"`
+		ctype := strings.Split(*contenttype, ";")[0]
+		context.typeStats[ctype] += 1
+
 		context.statsMutex.Unlock()
-	}
-	return nil
+
+		atomic.AddInt64(&context.processedObjects, 1)
+		sec := time.Since(context.start).Seconds()
+		o_s := float64(context.processedObjects) / sec
+		expectedDuration := time.Duration(int(float64(context.expectedObjects-context.processedObjects)/o_s)) * time.Second
+		days := int(expectedDuration.Hours() / 24)
+		andHours := expectedDuration.Hours() - float64(days)*24
+		eta := fmt.Sprintf("%dd %.1fh", days, andHours)
+		if days == 0 {
+			hours := int(expectedDuration.Minutes() / 60)
+			andMinutes := expectedDuration.Minutes() - float64(hours)*60
+			eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
+		}
+		if context.expectedObjects < context.processedObjects {
+			eta = "-"
+		}
+
+		const everySeconds = 10
+		show := false
+		context.statusLineMutex.Lock()
+		if context.lastStatusShown < sec-everySeconds {
+			show = true
+			context.lastStatusShown = sec
+		}
+		context.statusLineMutex.Unlock()
+
+		if show {
+			context.statsMutex.Lock()
+			fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
+				name, context.processedObjects, context.expectedObjects, o_s, eta,
+			)
+			fmt.Printf("\nContent-Type stats:\n")
+			for k, v := range context.typeStats {
+				fmt.Printf("%s %d\n", k, v)
+			}
+			fmt.Printf("\nCopy status stats:\n")
+			for k, v := range context.statusStats {
+				fmt.Printf("%s %d\n", k, v)
+			}
+			context.statsMutex.Unlock()
+		}
+	*/
 }
