@@ -196,14 +196,16 @@ func main() {
 		parallelity := c.GlobalInt("parallelity")
 
 		names := make(chan string, context.options.batchsize*3) // enable uninterrupted stream of files to copy
-		events := make(chan CopyResult)
+		events := make(chan CopyResult, 10000)
 		getExpectedSize(&context)
 
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
 			go cpworker(&context, names, events)
 		}
-		go processStats(context.expectedObjects, events)
+		waitStats := sync.WaitGroup{}
+		waitStats.Add(1)
+		go processStats(context.expectedObjects, events, &waitStats)
 
 		if c.GlobalBool("stdin") {
 			listObjectsFromStdin(names)
@@ -213,8 +215,8 @@ func main() {
 		close(names)
 		context.wg.Wait()
 		close(events)
+		waitStats.Wait()
 		fmt.Printf("\nDone.\n")
-		// TODO wait for stats processing finished
 		return nil
 	}
 	app.Run(os.Args)
@@ -405,7 +407,6 @@ func cp(context *CopyContext, name string) CopyResult {
 		}
 	}
 
-	var status string
 	// E - excluded pattern
 	// . - skip, Cache-Control and Content-Type already set
 	// X - type was not set, set to image/png
@@ -414,28 +415,28 @@ func cp(context *CopyContext, name string) CopyResult {
 	// P - pdf file; adjusted CacheControl
 	// Y - other file type; adjusted CacheControl
 	if context.exclude.MatchString(name) && IsPicture(from) {
-		status = "E"
+		res.status = "E"
 	} else if target != nil && target.CacheControl != nil && *target.CacheControl == context.newvalue &&
 		target.ContentType != nil {
-		status = "."
+		res.status = "."
 	} else if context.copiedObjects > context.maxObjectsToCopy {
-		status = ","
+		res.status = ","
 	} else {
 		if contenttype == nil {
-			status = "X"
+			res.status = "X"
 			contenttype = aws.String("image/png")
 		} else {
 			// DEBUG: fmt.Printf("\nkey %s, from: %s target: %s\n", key, str(from), str(target))
 			// contenttype = contenttypes[0] // theoretically, there can be multiple HTTP headers with the same key
 			// but lets assume, there is at most one
 			if *contenttype == "image/png" {
-				status = "g"
+				res.status = "g"
 			} else if *contenttype == "image/jpeg" {
-				status = "j"
+				res.status = "j"
 			} else if *contenttype == "application/pdf" {
-				status = "P"
+				res.status = "P"
 			} else {
-				status = "Y"
+				res.status = "Y"
 			}
 		}
 
@@ -457,7 +458,6 @@ func cp(context *CopyContext, name string) CopyResult {
 		}
 		atomic.AddInt64(&context.copiedObjects, 1)
 	}
-	fmt.Print(status)
 
 	if contenttype == nil {
 		res.contenttype = ""
@@ -467,73 +467,78 @@ func cp(context *CopyContext, name string) CopyResult {
 	return res
 }
 
-func processStats(expected int64, events <-chan CopyResult) {
-	// var copiedObjects int64
+func processStats(expected int64, events <-chan CopyResult, running *sync.WaitGroup) {
 	var processedObjects int64 // including ignored and skipped
 	start := time.Now()
 	statusStats := make(map[string]int)
 	typeStats := make(map[string]int)
-	var lastStatusShown float64
+	last := ""
+	every := time.NewTicker(5 * time.Second)
+
+	showStats := func() {
+		sec := time.Since(start).Seconds()
+		o_s := float64(processedObjects) / sec
+		expectedDuration := time.Duration(int(float64(expected-processedObjects)/o_s)) * time.Second
+		days := int(expectedDuration.Hours() / 24)
+		andHours := expectedDuration.Hours() - float64(days)*24
+		eta := fmt.Sprintf("%dd %.1fh", days, andHours)
+		if days == 0 {
+			hours := int(expectedDuration.Minutes() / 60)
+			andMinutes := expectedDuration.Minutes() - float64(hours)*60
+			eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
+		}
+		if expected < processedObjects {
+			eta = "-"
+		}
+
+		fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
+			last, processedObjects, expected, o_s, eta,
+		)
+		fmt.Printf("\nContent-Type stats:\n")
+		for k, v := range typeStats {
+			fmt.Printf("%s %d\n", k, v)
+		}
+		fmt.Printf("\nCopy status stats:\n")
+		for k, v := range statusStats {
+			fmt.Printf("%s %d\n", k, v)
+		}
+	}
+
 	for {
-		event, more := <-events
-		if more {
-			// fmt.Printf("\n%s\n", event.contenttype)
-			if event.err != nil {
-				os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", event.key, event.err))
-				filename := "error_keys.txt"
-				os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
-				f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-				if err != nil {
-					os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
-					panic(err)
+		select {
+		case <-every.C:
+			showStats()
+			time.Sleep(4 * time.Second) // give the user opportunity to read
+		case event, more := <-events:
+			if more {
+				// fmt.Printf("\n%s\n", event.contenttype)
+				if event.err != nil {
+					os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", event.key, event.err))
+					filename := "error_keys.txt"
+					os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
+					f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+					if err != nil {
+						os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
+						panic(err)
+					}
+					fmt.Fprintln(f, event.key)
+					f.Close()
 				}
-				fmt.Fprintln(f, event.key)
-				f.Close()
-			}
 
-			statusStats[event.status] += 1
-			// extract interesting part before semicolon, like "mulitpart/package"
-			// from `multipart/package; boundary="_-------------1437962543790"`
-			ctype := strings.Split(event.contenttype, ";")[0]
-			typeStats[ctype] += 1
-
-			atomic.AddInt64(&processedObjects, 1)
-			sec := time.Since(start).Seconds()
-			o_s := float64(processedObjects) / sec
-			expectedDuration := time.Duration(int(float64(expected-processedObjects)/o_s)) * time.Second
-			days := int(expectedDuration.Hours() / 24)
-			andHours := expectedDuration.Hours() - float64(days)*24
-			eta := fmt.Sprintf("%dd %.1fh", days, andHours)
-			if days == 0 {
-				hours := int(expectedDuration.Minutes() / 60)
-				andMinutes := expectedDuration.Minutes() - float64(hours)*60
-				eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
+				statusStats[event.status] += 1
+				// extract interesting part before semicolon, like "mulitpart/package"
+				// from `multipart/package; boundary="_-------------1437962543790"`
+				ctype := strings.Split(event.contenttype, ";")[0]
+				typeStats[ctype] += 1
+				processedObjects += 1
+				last = event.key
+				fmt.Print(event.status)
+			} else {
+				fmt.Printf("\n\n## Event channel closed. Final statistics:\n")
+				showStats()
+				running.Done()
+				return
 			}
-			if expected < processedObjects {
-				eta = "-"
-			}
-
-			const everySeconds = 3
-			show := false
-			if lastStatusShown < sec-everySeconds {
-				show = true
-				lastStatusShown = sec
-			}
-
-			if show {
-				fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
-					event.key, processedObjects, expected, o_s, eta,
-				)
-				fmt.Printf("\nContent-Type stats:\n")
-				for k, v := range typeStats {
-					fmt.Printf("%s %d\n", k, v)
-				}
-				fmt.Printf("\nCopy status stats:\n")
-				for k, v := range statusStats {
-					fmt.Printf("%s %d\n", k, v)
-				}
-			}
-
 		}
 	}
 
