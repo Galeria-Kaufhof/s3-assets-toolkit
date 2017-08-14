@@ -105,9 +105,10 @@ func listObjectsFromStdin(names chan<- string) {
 }
 
 func listObjectsToCopy(names chan<- string, bucketname string, continueFromKey string, context *CopyContext) {
+	fmt.Printf("Batch size for list: %d\n", context.options.batchsize)
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
-		MaxKeys: aws.Int64(1000),
+		MaxKeys: aws.Int64(context.options.batchsize),
 	}
 	if continueFromKey != "" {
 		input.StartAfter = &continueFromKey
@@ -194,7 +195,7 @@ func main() {
 		// Also fits AWS API limits, avoid "503 SlowDown: Please reduce your request rate."
 		parallelity := c.GlobalInt("parallelity")
 
-		names := make(chan string, 3000)
+		names := make(chan string, context.options.batchsize*3) // enable uninterrupted stream of files to copy
 		events := make(chan CopyResult)
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
@@ -222,7 +223,10 @@ func CheckPublicCommentTmp() {
 
 /* CopyContext defines context for running concurrent copy operations and remembers the progress */
 type CopyContext struct {
-	s3svc          *s3.S3
+	s3svc *s3.S3
+
+	options CopyOptions
+
 	target         string
 	from           string
 	newvalue       string
@@ -252,6 +256,7 @@ type CopyOptions struct {
 	exclude        regexp.Regexp
 	cloudwatchRole string
 	noop           bool
+	batchsize      int64
 }
 
 type CopyResult struct {
@@ -306,6 +311,16 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 	if exclude_pattern == "" {
 		exclude_pattern = "^some-pattern-which-would-never-match$"
 	}
+
+	o := CopyOptions{}
+	o.batchsize = c.GlobalInt64("first-n") / 2
+	if o.batchsize > 1000 {
+		o.batchsize = 1000
+	}
+	if o.batchsize < 10 {
+		o.batchsize = 10
+	}
+
 	return CopyContext{
 		s3svc:            s3.New(sess),
 		target:           target,
@@ -319,6 +334,7 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		start:            time.Now(),
 		statusStats:      make(map[string]int),
 		typeStats:        make(map[string]int),
+		options:          o,
 	}, nil
 }
 
@@ -465,6 +481,7 @@ func processStats(events <-chan CopyResult) {
 	for {
 		event, more := <-events
 		if more {
+			// fmt.Printf("\n%s\n", event.contenttype)
 			if event.err != nil {
 				os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", event.key, event.err))
 				filename := "error_keys.txt"
