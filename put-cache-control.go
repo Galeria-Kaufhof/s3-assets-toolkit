@@ -15,7 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	_ "strings"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -197,13 +197,14 @@ func main() {
 
 		names := make(chan string, context.options.batchsize*3) // enable uninterrupted stream of files to copy
 		events := make(chan CopyResult)
+		getExpectedSize(&context)
+
 		context.wg.Add(parallelity)
 		for gr := 1; gr <= parallelity; gr++ {
 			go cpworker(&context, names, events)
 		}
-		go processStats(events)
+		go processStats(context.expectedObjects, events)
 
-		getExpectedSize(&context)
 		if c.GlobalBool("stdin") {
 			listObjectsFromStdin(names)
 		} else {
@@ -211,6 +212,7 @@ func main() {
 		}
 		close(names)
 		context.wg.Wait()
+		close(events)
 		fmt.Printf("\nDone.\n")
 		// TODO wait for stats processing finished
 		return nil
@@ -234,17 +236,9 @@ type CopyContext struct {
 	cloudwatchRole string
 	noop           bool
 
-	copiedObjects    int64
 	maxObjectsToCopy int64
-	processedObjects int64 // including ignored and skipped
-	copiedBytes      int64
 	expectedObjects  int64
-	start            time.Time
-	statusLineMutex  sync.Mutex
-	lastStatusShown  float64
-	statsMutex       sync.Mutex
-	statusStats      map[string]int
-	typeStats        map[string]int
+	copiedObjects    int64
 
 	wg sync.WaitGroup
 }
@@ -281,7 +275,6 @@ func prepareContext() (CopyContext, error) {
 		target:          os.Args[1],
 		expectedObjects: 3867874,
 		newvalue:        os.Args[2],
-		start:           time.Now(),
 	}, nil
 }
 
@@ -331,9 +324,6 @@ func prepareContextFromCli(c *cli.Context) (CopyContext, error) {
 		newvalue:         c.GlobalString("cache-control"),
 		exclude:          *regexp.MustCompile(exclude_pattern),
 		cloudwatchRole:   c.GlobalString("cross-account-cloudwatch-role"),
-		start:            time.Now(),
-		statusStats:      make(map[string]int),
-		typeStats:        make(map[string]int),
 		options:          o,
 	}, nil
 }
@@ -477,7 +467,13 @@ func cp(context *CopyContext, name string) CopyResult {
 	return res
 }
 
-func processStats(events <-chan CopyResult) {
+func processStats(expected int64, events <-chan CopyResult) {
+	// var copiedObjects int64
+	var processedObjects int64 // including ignored and skipped
+	start := time.Now()
+	statusStats := make(map[string]int)
+	typeStats := make(map[string]int)
+	var lastStatusShown float64
 	for {
 		event, more := <-events
 		if more {
@@ -494,58 +490,51 @@ func processStats(events <-chan CopyResult) {
 				fmt.Fprintln(f, event.key)
 				f.Close()
 			}
+
+			statusStats[event.status] += 1
+			// extract interesting part before semicolon, like "mulitpart/package"
+			// from `multipart/package; boundary="_-------------1437962543790"`
+			ctype := strings.Split(event.contenttype, ";")[0]
+			typeStats[ctype] += 1
+
+			atomic.AddInt64(&processedObjects, 1)
+			sec := time.Since(start).Seconds()
+			o_s := float64(processedObjects) / sec
+			expectedDuration := time.Duration(int(float64(expected-processedObjects)/o_s)) * time.Second
+			days := int(expectedDuration.Hours() / 24)
+			andHours := expectedDuration.Hours() - float64(days)*24
+			eta := fmt.Sprintf("%dd %.1fh", days, andHours)
+			if days == 0 {
+				hours := int(expectedDuration.Minutes() / 60)
+				andMinutes := expectedDuration.Minutes() - float64(hours)*60
+				eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
+			}
+			if expected < processedObjects {
+				eta = "-"
+			}
+
+			const everySeconds = 3
+			show := false
+			if lastStatusShown < sec-everySeconds {
+				show = true
+				lastStatusShown = sec
+			}
+
+			if show {
+				fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
+					event.key, processedObjects, expected, o_s, eta,
+				)
+				fmt.Printf("\nContent-Type stats:\n")
+				for k, v := range typeStats {
+					fmt.Printf("%s %d\n", k, v)
+				}
+				fmt.Printf("\nCopy status stats:\n")
+				for k, v := range statusStats {
+					fmt.Printf("%s %d\n", k, v)
+				}
+			}
+
 		}
 	}
 
-	/*
-		context.statsMutex.Lock()
-		context.statusStats[status] += 1
-		// extract interesting part before semicolon, like "mulitpart/package"
-		// from `multipart/package; boundary="_-------------1437962543790"`
-		ctype := strings.Split(*contenttype, ";")[0]
-		context.typeStats[ctype] += 1
-
-		context.statsMutex.Unlock()
-
-		atomic.AddInt64(&context.processedObjects, 1)
-		sec := time.Since(context.start).Seconds()
-		o_s := float64(context.processedObjects) / sec
-		expectedDuration := time.Duration(int(float64(context.expectedObjects-context.processedObjects)/o_s)) * time.Second
-		days := int(expectedDuration.Hours() / 24)
-		andHours := expectedDuration.Hours() - float64(days)*24
-		eta := fmt.Sprintf("%dd %.1fh", days, andHours)
-		if days == 0 {
-			hours := int(expectedDuration.Minutes() / 60)
-			andMinutes := expectedDuration.Minutes() - float64(hours)*60
-			eta = fmt.Sprintf("%dh %.1fm", hours, andMinutes)
-		}
-		if context.expectedObjects < context.processedObjects {
-			eta = "-"
-		}
-
-		const everySeconds = 10
-		show := false
-		context.statusLineMutex.Lock()
-		if context.lastStatusShown < sec-everySeconds {
-			show = true
-			context.lastStatusShown = sec
-		}
-		context.statusLineMutex.Unlock()
-
-		if show {
-			context.statsMutex.Lock()
-			fmt.Printf("\n%-30s Totals: %d/%d objects. Avg: %.2f obj/s. ETA: %v    \n",
-				name, context.processedObjects, context.expectedObjects, o_s, eta,
-			)
-			fmt.Printf("\nContent-Type stats:\n")
-			for k, v := range context.typeStats {
-				fmt.Printf("%s %d\n", k, v)
-			}
-			fmt.Printf("\nCopy status stats:\n")
-			for k, v := range context.statusStats {
-				fmt.Printf("%s %d\n", k, v)
-			}
-			context.statsMutex.Unlock()
-		}
-	*/
 }
