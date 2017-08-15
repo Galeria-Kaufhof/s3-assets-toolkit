@@ -473,7 +473,7 @@ func processStats(expected int64, events <-chan CopyResult, running *sync.WaitGr
 	statusStats := make(map[string]int)
 	typeStats := make(map[string]int)
 	last := ""
-	every := time.NewTicker(5 * time.Second)
+	every := time.NewTicker(12 * time.Second)
 
 	showStats := func() {
 		sec := time.Since(start).Seconds()
@@ -504,6 +504,21 @@ func processStats(expected int64, events <-chan CopyResult, running *sync.WaitGr
 		}
 	}
 
+	fileToWrite := func(name string) *os.File {
+		f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Could not create file '%s'. Error: %v\n", name, err))
+			panic(err)
+		}
+		return f
+	}
+
+	run := time.Now().Format("2006-01-02-150405")
+	fList := fileToWrite(run + "-objects.log")
+	defer fList.Close()
+	fErrors := fileToWrite(run + "-error-keys.log")
+	defer fErrors.Close()
+
 	for {
 		select {
 		case <-every.C:
@@ -511,18 +526,10 @@ func processStats(expected int64, events <-chan CopyResult, running *sync.WaitGr
 			time.Sleep(4 * time.Second) // give the user opportunity to read
 		case event, more := <-events:
 			if more {
-				// fmt.Printf("\n%s\n", event.contenttype)
+				fmt.Fprintf(fList, "%s\t%s\t%s\n", event.status, event.contenttype, event.key)
 				if event.err != nil {
 					os.Stderr.WriteString(fmt.Sprintf("==> Failed processing '%s': %v\n", event.key, event.err))
-					filename := "error_keys.txt"
-					os.Stderr.WriteString(fmt.Sprintf("Adding name to '%s' for later processing or reference", filename))
-					f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-					if err != nil {
-						os.Stderr.WriteString(fmt.Sprintf("Could not write to 'TODO' file '%s'. Error: %v\n", filename, err))
-						panic(err)
-					}
-					fmt.Fprintln(f, event.key)
-					f.Close()
+					fmt.Fprintln(fErrors, event.key)
 				}
 
 				statusStats[event.status] += 1
