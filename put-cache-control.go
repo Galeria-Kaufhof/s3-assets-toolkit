@@ -97,14 +97,25 @@ func getExpectedSize(context *CopyContext) {
 	fmt.Printf("Objects to copy/check: %d\n", context.expectedObjects)
 }
 
-func listObjectsFromStdin(names chan<- string) {
+// listObjectsFromStdin reads from stdin one object name per line.
+// Also supports wildcard * at the end of the name.
+func listObjectsFromStdin(names chan<- string, context *CopyContext) {
 	input := bufio.NewScanner(os.Stdin)
 	for input.Scan() {
-		names <- input.Text()
+		name := input.Text()
+		if strings.HasSuffix(name, "*") {
+			prefix := name[:len(name)-1]
+			if strings.HasPrefix(name, "/") {
+				prefix = prefix[1:] // remove leading slash if any
+			}
+			listObjectsToCopy(names, context.from, "", prefix, context)
+		} else {
+			names <- name
+		}
 	}
 }
 
-func listObjectsToCopy(names chan<- string, bucketname string, continueFromKey string, context *CopyContext) {
+func listObjectsToCopy(names chan<- string, bucketname, continueFromKey, prefix string, context *CopyContext) {
 	fmt.Printf("Batch size for list: %d\n", context.options.batchsize)
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
@@ -113,7 +124,12 @@ func listObjectsToCopy(names chan<- string, bucketname string, continueFromKey s
 	if continueFromKey != "" {
 		input.StartAfter = &continueFromKey
 	}
+	if prefix != "" {
+		fmt.Printf("Looking for prefix: %s\n", prefix)
+		input.Prefix = &prefix
+	}
 
+	fmt.Printf("input: %v\n", input)
 	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			// Could use following if cloudwatch based metrics are not available:
@@ -208,9 +224,9 @@ func main() {
 		go processStats(context.expectedObjects, events, &waitStats)
 
 		if c.GlobalBool("stdin") {
-			listObjectsFromStdin(names)
+			listObjectsFromStdin(names, &context)
 		} else {
-			listObjectsToCopy(names, context.from, c.GlobalString("continue"), &context)
+			listObjectsToCopy(names, context.from, c.GlobalString("continue"), "", &context)
 		}
 		close(names)
 		context.wg.Wait()
