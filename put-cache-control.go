@@ -94,7 +94,7 @@ func getExpectedSize(context *CopyContext) {
 		context.expectedObjects = 0 // unknown
 		return
 	}
-	fmt.Printf("Objects to copy/check: %d\n", context.expectedObjects)
+	fmt.Printf("Objects in the 'from' bucket: %d\n", context.expectedObjects)
 }
 
 // listObjectsFromStdin reads from stdin one object name per line.
@@ -102,7 +102,10 @@ func getExpectedSize(context *CopyContext) {
 func listObjectsFromStdin(names chan<- string, context *CopyContext) {
 	input := bufio.NewScanner(os.Stdin)
 	for input.Scan() {
-		name := input.Text()
+		name := strings.TrimSpace(input.Text())
+		if name == "" || strings.HasPrefix(name, "#") {
+			continue // skip empty and comment lines
+		}
 		if strings.HasSuffix(name, "*") {
 			prefix := name[:len(name)-1]
 			if strings.HasPrefix(name, "/") {
@@ -116,7 +119,7 @@ func listObjectsFromStdin(names chan<- string, context *CopyContext) {
 }
 
 func listObjectsToCopy(names chan<- string, bucketname, continueFromKey, prefix string, context *CopyContext) {
-	fmt.Printf("Batch size for list: %d\n", context.options.batchsize)
+	// fmt.Printf("Batch size for list: %d\n", context.options.batchsize)
 	input := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(bucketname),
 		MaxKeys: aws.Int64(context.options.batchsize),
@@ -125,11 +128,9 @@ func listObjectsToCopy(names chan<- string, bucketname, continueFromKey, prefix 
 		input.StartAfter = &continueFromKey
 	}
 	if prefix != "" {
-		fmt.Printf("Looking for prefix: %s\n", prefix)
 		input.Prefix = &prefix
 	}
 
-	fmt.Printf("input: %v\n", input)
 	err := context.s3svc.ListObjectsV2Pages(input,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			// Could use following if cloudwatch based metrics are not available:
